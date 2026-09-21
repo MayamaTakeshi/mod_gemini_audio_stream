@@ -1,0 +1,55 @@
+name: Build
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    container:
+      # Published together with the integration digest from main@9b310c95.
+      # Update this, code-checks.yml and tests.yml from the same CI Images run.
+      image: ghcr.io/voismart/mod-openai-realtime-ci@sha256:10d209dc05d03c5f79b9831a4f674ea4d1c9f71e39ffe8b458e0a96ad7bff293
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+
+      - name: Cache ccache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/ccache
+          key: ${{ runner.os }}-ccache-${{ hashFiles('**/CMakeLists.txt', '**/*.cmake') }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-ccache-${{ hashFiles('**/CMakeLists.txt', '**/*.cmake') }}-
+            ${{ runner.os }}-ccache-
+
+      - name: Configure & Build with TLS
+        run: |
+          set -eux
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+                -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+          cmake --build build --parallel "$(nproc)"
+
+      - name: Configure & Build without TLS
+        run: |
+          set -eux
+          cmake -S . -B build-no-tls -DCMAKE_BUILD_TYPE=Release -DUSE_TLS=OFF \
+                -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+                -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+          cmake --build build-no-tls --parallel "$(nproc)"

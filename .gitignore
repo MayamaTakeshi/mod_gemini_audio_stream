@@ -1,0 +1,8 @@
+cmake-build-debug/
+.idea/
+.vscode/
+build*/
+_packages
+test_tools/
+__pycache__/
+*.pyc

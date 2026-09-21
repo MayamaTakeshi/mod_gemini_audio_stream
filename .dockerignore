@@ -1,0 +1,12 @@
+.git
+.github
+.idea
+.mypy_cache
+.vscode
+__pycache__
+*.pyc
+build*/
+cmake-build-debug
+review-report.md
+CLAUDE.md
+test_tools

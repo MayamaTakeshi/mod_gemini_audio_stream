@@ -1,0 +1,133 @@
+# syntax=docker/dockerfile:1.7
+
+ARG DEBIAN_IMAGE=docker.io/library/debian:12@sha256:9344f8b8992482f80cba753f323adeaf17690076c095ccff6cc9536be98185dc
+
+############################
+# Build pinned FreeSWITCH and its non-Debian dependencies
+############################
+FROM ${DEBIAN_IMAGE} AS builder
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+ARG LIBKS_REF=b756a6da9ccbc5ed92d1416d45cdb8b06a75d35b
+ARG SOFIA_SIP_REF=7333682a297f28130ff46d5ef0f9e2f72adca0e8
+ARG SPANDSP_REF=797760168945c96e91af55bde9d4edaea2e654f9
+ARG SIGNALWIRE_C_REF=d1d524c5a0fe3bd0b0023af69deab81401e75728
+ARG FREESWITCH_REF=ac9b8c621b3ac362ea1e153a929aaee6902a1b2d
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+	ca-certificates git curl wget \
+	build-essential cmake automake autoconf libtool libtool-bin libltdl-dev pkg-config \
+	libssl-dev zlib1g-dev libdb-dev unixodbc-dev libncurses5-dev libexpat1-dev \
+	libgdbm-dev bison erlang-dev libtpl-dev libtiff5-dev uuid-dev \
+	libpcre3-dev libpcre2-dev libedit-dev libsqlite3-dev libcurl4-openssl-dev nasm \
+	libogg-dev libspeex-dev libspeexdsp-dev libldns-dev python3-dev \
+	libavformat-dev libswscale-dev libswresample-dev \
+	liblua5.2-dev libopus-dev libpq-dev \
+	libsndfile1-dev libflac-dev libvorbis-dev \
+	&& rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+
+RUN git clone https://github.com/signalwire/libks \
+	&& git clone https://github.com/freeswitch/sofia-sip \
+	&& git clone https://github.com/freeswitch/spandsp \
+	&& git clone https://github.com/signalwire/signalwire-c \
+	&& git clone https://github.com/signalwire/freeswitch \
+	&& git -C libks checkout "${LIBKS_REF}" \
+	&& git -C sofia-sip checkout "${SOFIA_SIP_REF}" \
+	&& git -C spandsp checkout "${SPANDSP_REF}" \
+	&& git -C signalwire-c checkout "${SIGNALWIRE_C_REF}" \
+	&& git -C freeswitch checkout "${FREESWITCH_REF}"
+
+WORKDIR /src/libks
+RUN cmake . -DCMAKE_INSTALL_PREFIX=/usr -DWITH_LIBBACKTRACE=1 \
+	&& make -j"$(nproc)" \
+	&& make install
+
+WORKDIR /src/sofia-sip
+RUN ./bootstrap.sh \
+	&& ./configure --with-pic --with-glib=no --without-doxygen --disable-stun --prefix=/usr \
+	&& make -j"$(nproc)" \
+	&& make install
+
+WORKDIR /src/spandsp
+RUN ./bootstrap.sh \
+	&& ./configure --with-pic --prefix=/usr \
+	&& make -j"$(nproc)" \
+	&& make install
+
+WORKDIR /src/signalwire-c
+RUN PKG_CONFIG_PATH=/usr/lib/pkgconfig cmake . -DCMAKE_INSTALL_PREFIX=/usr \
+	&& make -j"$(nproc)" \
+	&& make install
+
+WORKDIR /src/freeswitch
+RUN ./bootstrap.sh -j \
+	&& ./configure --prefix=/usr \
+	&& make -j"$(nproc)" \
+	&& make install
+
+FROM builder AS runtime-files
+
+WORKDIR /src/freeswitch
+RUN make samples
+
+############################
+# SDK image: module build, format and static analysis
+############################
+FROM ${DEBIAN_IMAGE} AS sdk
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+	ca-certificates \
+	build-essential \
+	clang clang-format clang-tidy \
+	cppcheck cmake pkg-config ccache \
+	git \
+	libssl-dev zlib1g-dev \
+	libspeexdsp-dev \
+	libodbc2 libspeex1 libtiff6 libtpl0 \
+	&& update-ca-certificates \
+	&& rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /usr/include/freeswitch/ /usr/include/freeswitch/
+COPY --from=builder /usr/lib/pkgconfig/freeswitch.pc /usr/lib/pkgconfig/
+COPY --from=builder /usr/lib/libfreeswitch.so.1.0.0 /usr/lib/
+COPY --from=builder /usr/lib/libsofia-sip-ua.so.0.6.0 /usr/lib/
+COPY --from=builder /usr/lib/*/libspandsp.so.3.0.0 /usr/lib/
+
+RUN ln -s libfreeswitch.so.1.0.0 /usr/lib/libfreeswitch.so \
+	&& ldconfig
+
+WORKDIR /work
+
+############################
+# Integration image: SDK + configured FreeSWITCH runtime
+############################
+FROM sdk AS integration
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+	libavformat59 libcurl4 libdb5.3 libedit2 libexpat1 libflac12 libgdbm6 \
+	libldns3 liblua5.2-0 libltdl7 libncurses6 libogg0 libopus0 libpcre3 \
+	libpcre2-8-0 libpq5 libsndfile1 libsqlite3-0 libswscale6 \
+	libuuid1 libvorbis0a libvorbisenc2 \
+	python3 python3-websockets \
+	&& rm -rf /var/lib/apt/lists/*
+
+COPY --from=runtime-files /usr/bin/freeswitch /usr/bin/fs_cli /usr/bin/
+COPY --from=runtime-files /usr/etc/freeswitch/ /usr/etc/freeswitch/
+COPY --from=runtime-files /usr/lib/freeswitch/ /usr/lib/freeswitch/
+COPY --from=runtime-files /usr/share/freeswitch/ /usr/share/freeswitch/
+COPY --from=runtime-files /usr/lib/libks2.so.2* /usr/lib/
+COPY --from=runtime-files /usr/lib/libsignalwire_client2.so.2* /usr/lib/
+
+RUN ldconfig \
+	&& sed -i \
+		's/<param name="listen-ip" value="::"\/>/<param name="listen-ip" value="127.0.0.1"\/>/' \
+		/usr/etc/freeswitch/autoload_configs/event_socket.conf.xml
+
+WORKDIR /work

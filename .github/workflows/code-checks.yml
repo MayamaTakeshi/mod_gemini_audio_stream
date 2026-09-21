@@ -1,0 +1,123 @@
+name: Static Checks
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  analyze:
+    runs-on: ubuntu-22.04
+    container:
+      # Published together with the integration digest from main@9b310c95.
+      # Update this, build.yml and tests.yml from the same CI Images run.
+      image: ghcr.io/voismart/mod-openai-realtime-ci@sha256:10d209dc05d03c5f79b9831a4f674ea4d1c9f71e39ffe8b458e0a96ad7bff293
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+
+      - name: Setup git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Format check
+        run: |
+          set -eux
+          ALL_FILES="$(git ls-files '*.c' '*.cc' '*.cpp' '*.cxx' '*.h' '*.hh' '*.hpp')"
+          FILES="$(echo "$ALL_FILES" | grep -v '^libs/' || true)"
+          if [ -n "$FILES" ]; then
+            clang-format --dry-run --Werror $FILES
+          fi
+
+      - name: Configure
+        run: |
+          set -eux
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_COMPILER=clang++
+          cmake -S tests -B build-tests \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+            -DCMAKE_CXX_COMPILER=clang++
+
+      - name: Analyze
+        run: |
+          set -eux
+          ALL_FILES="$(git ls-files '*.c' '*.cc' '*.cpp' '*.cxx')"
+          MODULE_FILES="$(echo "$ALL_FILES" | grep -Ev '^(libs|tests)/' || true)"
+          TEST_FILES="$(echo "$ALL_FILES" | grep '^tests/' || true)"
+          if [ -n "$MODULE_FILES" ]; then
+            clang-tidy -p build $MODULE_FILES \
+              --warnings-as-errors='clang-analyzer-*,bugprone-*,performance-*'
+          else
+            echo "No module source files found for clang-tidy analysis."
+          fi
+          if [ -n "$TEST_FILES" ]; then
+            clang-tidy -p build-tests $TEST_FILES \
+              --warnings-as-errors='clang-analyzer-*,bugprone-*,performance-*'
+          else
+            echo "No test source files found for clang-tidy analysis."
+          fi
+
+          : > cppcheck-warn.log
+          for compile_commands in build/compile_commands.json build-tests/compile_commands.json; do
+            if ! cppcheck --enable=warning,performance,portability --std=c++11 --force \
+                     --error-exitcode=1 \
+                     --project="$compile_commands" \
+                     --suppress=missingIncludeSystem \
+                     --suppress='*:*libs/IXWebSocket/*' \
+                     -i "$GITHUB_WORKSPACE/build" \
+                     -i "$GITHUB_WORKSPACE/build-tests" \
+                     -i "$GITHUB_WORKSPACE/libs" 2>> cppcheck-warn.log; then
+              cat cppcheck-warn.log
+              exit 1
+            fi
+          done
+          if [ -s cppcheck-warn.log ]; then
+            echo "Warnings found by cppcheck:"
+            cat cppcheck-warn.log
+          else
+            echo "No warnings found by cppcheck."
+          fi
+
+          : > cppcheck-style.log
+          for compile_commands in build/compile_commands.json build-tests/compile_commands.json; do
+            cppcheck --enable=style --std=c++11 --force \
+                     --project="$compile_commands" \
+                     --suppress=missingIncludeSystem \
+                     --suppress='*:*libs/IXWebSocket/*' \
+                     -i "$GITHUB_WORKSPACE/build" \
+                     -i "$GITHUB_WORKSPACE/build-tests" \
+                     -i "$GITHUB_WORKSPACE/libs" 2>> cppcheck-style.log
+          done
+
+          if [ -s cppcheck-style.log ]; then
+            echo "Style issues found by cppcheck:"
+            cat cppcheck-style.log
+          else
+            echo "No style issues found by cppcheck."
+          fi
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: static-checks-logs
+          path: |
+            cppcheck-warn.log
+            cppcheck-style.log
+            build/compile_commands.json
+            build-tests/compile_commands.json

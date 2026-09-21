@@ -1,0 +1,44 @@
+name: Tests
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+  workflow_dispatch:
+  workflow_call:
+
+concurrency:
+  group: tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  test:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    env:
+      # Published together with the SDK digest from main@9b310c95.
+      # Update this, build.yml and code-checks.yml from the same CI Images run.
+      INTEGRATION_BASE_IMAGE: ghcr.io/voismart/mod-openai-realtime-ci@sha256:990895d03dc59086c7ec257361ebf92475d8adf4fa2c8184e74ffb1aab232fed
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull pinned integration environment
+        run: docker pull "${INTEGRATION_BASE_IMAGE}"
+
+      - name: Run unit and integration tests
+        run: ./tests/run-integration.sh
