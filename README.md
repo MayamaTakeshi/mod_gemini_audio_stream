@@ -64,6 +64,9 @@ Notes:
 - Gemini's Live API **requires** a `setup` message as the very first WebSocket frame. Send it with
   `uuid_gemini_audio_stream ... send_json <base64json>`. The module holds caller audio until the
   server acknowledges with `setupComplete`, so the ordering requirement is enforced automatically.
+- The module does not reconnect after a WebSocket disconnect. The FreeSWITCH controller is expected
+  to handle the disconnect (for example, by terminating the call); a new Gemini connection would
+  require a fresh setup handshake.
 - The `playback` with `silence_stream://-1//` keeps the media flowing so model audio can be written
   to the channel. See [mod_audio_stream](https://github.com/amigniter/mod_audio_stream) issue
   patterns for details.
@@ -98,7 +101,6 @@ forwarded unchanged to event subscribers.
 |---|---|---|
 | `STREAM_GEMINI_API_KEY` | Google API key; adds the `X-Goog-Api-Key` header (merged with, and taking precedence over, `STREAM_EXTRA_HEADERS`) | none |
 | `STREAM_EXTRA_HEADERS` | JSON object of extra WebSocket headers | none |
-| `STREAM_NO_RECONNECT` | true/1 disables ixwebsocket automatic reconnection | false |
 | `STREAM_HEART_BEAT` | WebSocket ping interval in seconds (1..3600) | none |
 | `STREAM_TLS_CA_FILE` | Path to a CA bundle, or `NONE`/`SYSTEM` | system |
 | `STREAM_TLS_KEY_FILE` / `STREAM_TLS_CERT_FILE` | Client TLS certificate | none |

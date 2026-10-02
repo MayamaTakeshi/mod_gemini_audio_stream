@@ -231,7 +231,6 @@ class ModuleIntegrationTest(unittest.TestCase):
         self.uuid = self.originate_call()
         assert_ok(self, f"uuid_setvar {self.uuid} STREAM_GEMINI_API_KEY integration-test-key")
         assert_ok(self, f"uuid_setvar {self.uuid} STREAM_DISABLE_AUDIOFILES true")
-        assert_ok(self, f"uuid_setvar {self.uuid} STREAM_NO_RECONNECT true")
 
     def tearDown(self):
         if getattr(self, "uuid", None):

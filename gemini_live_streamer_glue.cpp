@@ -115,7 +115,7 @@ size_t extract_server_content_audio(cJSON *json, std::vector<std::string>& audio
 class AudioStreamer {
   public:
     AudioStreamer(const char *uuid, const char *wsUri, responseHandler_t callback, int deflate, int heart_beat,
-                  bool suppressLog, const char *extra_headers, bool no_reconnect, const char *tls_cafile,
+                  bool suppressLog, const char *extra_headers, const char *tls_cafile,
                   const char *tls_keyfile, const char *tls_certfile, bool tls_disable_hostname_validation,
                   uint32_t session_sampling, uint32_t playback_sampling, uint32_t send_sampling,
                   bool disable_audiofiles, bool raw_audio_mode, private_t *context)
@@ -184,8 +184,9 @@ class AudioStreamer {
         if (!headers.empty())
             webSocket.setExtraHeaders(headers);
 
-        if (no_reconnect)
-            webSocket.disableAutomaticReconnection();
+        // A Gemini Live connection is a session; reconnecting creates a fresh peer
+        // that requires a new setup handshake the controller may not be able to replay.
+        webSocket.disableAutomaticReconnection();
 
         // Setup a callback to be fired when a message or an event (open, close, error) is received
         webSocket.setOnMessageCallback([this](const ix::WebSocketMessagePtr& msg) {
@@ -223,12 +224,9 @@ class AudioStreamer {
                 // A new connection starts a new PCM stream: forget any half-sample carried over
                 m_has_pending_raw_byte = false;
 
-                // Gemini requires a setup handshake on every connection. Reset the audio gate so
-                // a reconnected session must be re-setup by the controlling element; buffered
-                // pre-setup audio from the previous session must not leak into the new one.
-                m_setup_complete.store(false, std::memory_order_release);
                 {
                     std::lock_guard<std::mutex> lock(m_pending_audio_mutex);
+                    m_setup_complete.store(false, std::memory_order_release);
                     m_pending_audio.clear();
                 }
                 m_pending_overflow_logged.store(false);
@@ -340,23 +338,19 @@ class AudioStreamer {
                     m_notify(psession, EVENT_DISCONNECT, message);
 
                     // Any aggregated capture residue belongs to the dropped connection: have the
-                    // media thread discard it instead of mixing it with audio sent after a reconnect
+                    // media thread discard it rather than sending stale audio.
                     request_capture_reset();
 
-                    if (!webSocket.isAutomaticReconnectionEnabled()) {
-                        // No more audio can arrive: let write_frame drain the tail, then tear down
-                        m_response_audio_done = true;
-                        m_terminal_close = true;
-                    }
+                    // No more audio can arrive: let write_frame drain the tail, then tear down.
+                    m_response_audio_done = true;
+                    m_terminal_close = true;
 
                     break;
                 case CONNECT_ERROR:
                     switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(psession), SWITCH_LOG_INFO, "connection error\n");
                     m_notify(psession, EVENT_ERROR, message);
 
-                    if (!webSocket.isAutomaticReconnectionEnabled()) {
-                        request_media_bug_close();
-                    }
+                    request_media_bug_close();
 
                     break;
                 case MESSAGE:
@@ -565,7 +559,6 @@ class AudioStreamer {
                 switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
                                   "(%s) processMessage - Gemini setup complete, opening audio input\n",
                                   m_sessionId.c_str());
-                m_setup_complete.store(true, std::memory_order_release);
                 flush_pending_audio();
                 // fall through: forward the acknowledgement to event subscribers
                 break;
@@ -793,22 +786,26 @@ class AudioStreamer {
         bool sent;
         if (m_raw_audio_mode) {
             sent = writeBinary(buffer, len);
-        } else if (!m_setup_complete.load(std::memory_order_acquire)) {
-            std::lock_guard<std::mutex> lock(m_pending_audio_mutex);
-            if (m_pending_audio.size() + len > MAX_SETUP_PENDING_BYTES) {
-                if (!m_pending_overflow_logged.exchange(true)) {
-                    switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
-                                      "(%s) sendAudio: setup not yet complete and pending buffer full (%d bytes), "
-                                      "dropping caller audio\n",
-                                      m_sessionId.c_str(), MAX_SETUP_PENDING_BYTES);
-                }
-                sent = false;
-            } else {
-                m_pending_audio.insert(m_pending_audio.end(), buffer, buffer + len);
-                sent = true;
-            }
         } else {
-            sent = sendRealtimeInput(buffer, len);
+            std::lock_guard<std::mutex> lock(m_pending_audio_mutex);
+            if (!m_setup_complete.load(std::memory_order_acquire)) {
+                if (m_pending_audio.size() + len > MAX_SETUP_PENDING_BYTES) {
+                    if (!m_pending_overflow_logged.exchange(true)) {
+                        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+                                          "(%s) sendAudio: setup not yet complete and pending buffer full (%d bytes), "
+                                          "dropping caller audio\n",
+                                          m_sessionId.c_str(), MAX_SETUP_PENDING_BYTES);
+                    }
+                    sent = false;
+                } else {
+                    m_pending_audio.insert(m_pending_audio.end(), buffer, buffer + len);
+                    sent = true;
+                }
+            } else {
+                // Serialize post-setup frames with flush_pending_audio() so buffered
+                // pre-setup PCM is always queued ahead of newer caller audio.
+                sent = sendRealtimeInput(buffer, len);
+            }
         }
 
         if (!sent) {
@@ -825,11 +822,10 @@ class AudioStreamer {
     }
 
     void flush_pending_audio() {
+        std::lock_guard<std::mutex> lock(m_pending_audio_mutex);
+        m_setup_complete.store(true, std::memory_order_release);
         std::vector<uint8_t> held;
-        {
-            std::lock_guard<std::mutex> lock(m_pending_audio_mutex);
-            held.swap(m_pending_audio);
-        }
+        held.swap(m_pending_audio);
         if (held.empty()) {
             return;
         }
@@ -1039,7 +1035,7 @@ class LifecycleLockScope {
 switch_status_t stream_data_init(private_t *tech_pvt, switch_core_session_t *session, char *wsUri, uint32_t sampling,
                                  uint32_t playback_target_rate, int desiredSampling, int playback_sampling,
                                  int channels, responseHandler_t responseHandler, int deflate, int heart_beat,
-                                 bool suppressLog, int rtp_packets, const char *extra_headers, bool no_reconnect,
+                                 bool suppressLog, int rtp_packets, const char *extra_headers,
                                  const char *tls_cafile, const char *tls_keyfile, const char *tls_certfile,
                                  bool tls_disable_hostname_validation, bool disable_audiofiles,
                                  switch_bool_t start_muted, bool raw_audio_mode) {
@@ -1073,7 +1069,7 @@ switch_status_t stream_data_init(private_t *tech_pvt, switch_core_session_t *ses
     // whatever was already built.
     try {
         tech_pvt->pAudioStreamer = static_cast<void *>(new AudioStreamer(
-            tech_pvt->sessionId, wsUri, responseHandler, deflate, heart_beat, suppressLog, extra_headers, no_reconnect,
+            tech_pvt->sessionId, wsUri, responseHandler, deflate, heart_beat, suppressLog, extra_headers,
             tls_cafile, tls_keyfile, tls_certfile, tls_disable_hostname_validation, playback_target_rate,
             playback_sampling, sampling, disable_audiofiles, raw_audio_mode, tech_pvt));
         tech_pvt->stream_buffers = static_cast<void *>(new StreamBuffers());
@@ -1381,7 +1377,6 @@ switch_status_t stream_session_init(switch_core_session_t *session, responseHand
     const char *buffer_size;
     const char *extra_headers = NULL;
     int rtp_packets = 1;
-    bool no_reconnect = false;
     const char *tls_cafile = NULL;
     const char *tls_keyfile = NULL;
     const char *tls_certfile = NULL;
@@ -1399,10 +1394,6 @@ switch_status_t stream_session_init(switch_core_session_t *session, responseHand
 
     if (switch_channel_var_true(channel, "STREAM_SUPPRESS_LOG")) {
         suppressLog = true;
-    }
-
-    if (switch_channel_var_true(channel, "STREAM_NO_RECONNECT")) {
-        no_reconnect = true;
     }
 
     tls_cafile = switch_channel_get_variable(channel, "STREAM_TLS_CA_FILE");
@@ -1535,7 +1526,7 @@ switch_status_t stream_session_init(switch_core_session_t *session, responseHand
     if (SWITCH_STATUS_SUCCESS !=
         stream_data_init(tech_pvt, session, wsUri, samples_per_second, playback_target_rate, sampling,
                          playback_sampling, channels, responseHandler, deflate, heart_beat, suppressLog, rtp_packets,
-                         extra_headers, no_reconnect, tls_cafile, tls_keyfile, tls_certfile,
+                         extra_headers, tls_cafile, tls_keyfile, tls_certfile,
                          tls_disable_hostname_validation, disable_audiofiles, start_muted, raw_audio_mode)) {
         destroy_tech_pvt(tech_pvt);
         return SWITCH_STATUS_FALSE;

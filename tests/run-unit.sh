@@ -34,4 +34,4 @@ cmake -S "${project_dir}/tests" -B "${build_dir}" \
     -DCMAKE_BUILD_TYPE=Debug \
     ${sanitizer_args}
 cmake --build "${build_dir}" --parallel "${parallel_jobs}"
-ctest --test-dir "${build_dir}" --output-on-failure
+(cd "${build_dir}" && ctest --output-on-failure)
