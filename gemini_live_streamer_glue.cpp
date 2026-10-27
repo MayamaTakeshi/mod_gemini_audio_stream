@@ -1071,7 +1071,7 @@ switch_status_t stream_data_init(private_t *tech_pvt, switch_core_session_t *ses
         tech_pvt->pAudioStreamer = static_cast<void *>(new AudioStreamer(
             tech_pvt->sessionId, wsUri, responseHandler, deflate, heart_beat, suppressLog, extra_headers,
             tls_cafile, tls_keyfile, tls_certfile, tls_disable_hostname_validation, playback_target_rate,
-            playback_sampling, sampling, disable_audiofiles, raw_audio_mode, tech_pvt));
+            playback_sampling, desiredSampling, disable_audiofiles, raw_audio_mode, tech_pvt));
         tech_pvt->stream_buffers = static_cast<void *>(new StreamBuffers());
     } catch (const std::exception& e) {
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
