@@ -112,6 +112,19 @@ forwarded unchanged to event subscribers.
 | `STREAM_BUFFER_SIZE` | Capture aggregation window in ms (multiples of 20) | 20 |
 | `STREAM_DISABLE_AUDIOFILES` | true disables writing debug `.wav` files | false |
 
+## Capture batching
+
+`STREAM_BUFFER_SIZE` controls outgoing capture aggregation in multiples of 20 ms
+(default 20 ms), read when the stream starts. A 40 ms setting sends approximately
+25 audio messages per second per call instead of 50, using the same PCM sample
+rate and Gemini JSON format. It adds up to 20 ms of aggregation delay relative
+to the default; model/network response latency is separate. Configure it on the
+channel before starting the stream. The module default remains 20 ms.
+
+The capture path reuses its JSON message storage. Playback reuses resampling
+scratch memory and moves ordinary-sized audio chunks into the queue. Debug
+playback metadata is generated only when debug audio files are enabled.
+
 ## API
 
 ```

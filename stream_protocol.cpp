@@ -174,4 +174,17 @@ bool is_valid_utf8(const char *text) {
     return true;
 }
 
+RealtimeInputMessage::RealtimeInputMessage(uint32_t sample_rate)
+    : m_suffix("\",\"mimeType\":\"audio/pcm;rate=" + std::to_string(sample_rate) + "\"}}}") {
+}
+
+const std::string& RealtimeInputMessage::format(const std::string& base64_audio) {
+    static const std::string prefix = "{\"realtimeInput\":{\"audio\":{\"data\":\"";
+    m_message.reserve(prefix.size() + base64_audio.size() + m_suffix.size());
+    m_message.assign(prefix);
+    m_message.append(base64_audio);
+    m_message.append(m_suffix);
+    return m_message;
+}
+
 } // namespace stream_protocol

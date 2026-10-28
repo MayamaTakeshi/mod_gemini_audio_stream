@@ -2,6 +2,8 @@
 #define STREAM_PROTOCOL_H
 
 #include <cstddef>
+#include <cstdint>
+#include <string>
 
 namespace stream_protocol {
 
@@ -16,6 +18,18 @@ enum class ServerMessageType {
     GoAway,
     Error,
     Unhandled,
+};
+
+// Caller supplies codec-generated base64, whose alphabet needs no JSON escaping.
+// The returned message remains valid until the next format() call.
+class RealtimeInputMessage {
+  public:
+    explicit RealtimeInputMessage(uint32_t sample_rate);
+    const std::string& format(const std::string& base64_audio);
+
+  private:
+    std::string m_suffix;
+    std::string m_message;
 };
 
 ServerMessageType classify_server_message(const char *top_level_key);

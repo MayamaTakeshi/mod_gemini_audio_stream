@@ -100,10 +100,26 @@ void test_utf8_validation() {
     CHECK(!stream_protocol::is_valid_utf8(nullptr));
 }
 
+void test_realtime_input_json() {
+    stream_protocol::RealtimeInputMessage literal(16000);
+    CHECK(literal.format("AA==") == R"({"realtimeInput":{"audio":{"data":"AA==","mimeType":"audio/pcm;rate=16000"}}})");
+    for (uint32_t rate : {8000u, 16000u, 24000u}) {
+        stream_protocol::RealtimeInputMessage message(rate);
+        const std::string suffix = "\",\"mimeType\":\"audio/pcm;rate=" + std::to_string(rate) + "\"}}}";
+        for (const std::string& audio : {std::string("AAECA/8="), std::string(42668, 'A'),
+                                         std::string("+/8="), std::string("AA==")}) {
+            const std::string expected = "{\"realtimeInput\":{\"audio\":{\"data\":\"" + audio + suffix;
+            CHECK(message.format(audio) == expected);
+            CHECK(!stream_protocol::json_depth_exceeded(message.format(audio).c_str(), 128));
+        }
+    }
+}
+
 } // namespace
 
 int main() {
     int failures = 0;
+    failures += run_test("realtime input JSON and buffer reuse", test_realtime_input_json);
     failures += run_test("server message classification", test_server_message_classification);
     failures += run_test("JSON depth limit", test_json_depth_limit);
     failures += run_test("valid WebSocket URIs", test_valid_websocket_uris);

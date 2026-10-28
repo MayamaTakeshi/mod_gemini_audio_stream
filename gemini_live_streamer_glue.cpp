@@ -120,7 +120,7 @@ class AudioStreamer {
                   uint32_t session_sampling, uint32_t playback_sampling, uint32_t send_sampling,
                   bool disable_audiofiles, bool raw_audio_mode, private_t *context)
         : m_sessionId(uuid), m_notify(callback), m_suppress_log(suppressLog), m_playFile(0),
-          m_disable_audiofiles(disable_audiofiles), m_raw_audio_mode(raw_audio_mode), m_send_sample_rate(send_sampling),
+          m_disable_audiofiles(disable_audiofiles), m_raw_audio_mode(raw_audio_mode), m_input_message(send_sampling),
           m_context(context) {
 
         in_sample_rate = playback_sampling;
@@ -206,7 +206,7 @@ class AudioStreamer {
                         auto converted = convertRawAudio(msg->str);
                         if (!converted.empty()) {
                             m_response_audio_done = false;
-                            push_audio_queue(converted);
+                            push_audio_queue(std::move(converted));
                         }
                     } else {
                         // Gemini may mark JSON Live API frames as binary.  The
@@ -414,15 +414,16 @@ class AudioStreamer {
             return {};
         }
 
-        std::vector<int16_t> in_buffer(in_samples);
+        m_resample_input_buffer.resize(in_samples);
         std::vector<int16_t> out_buffer(out_samples);
 
-        std::memcpy(in_buffer.data(), data, usable_bytes);
+        std::memcpy(m_resample_input_buffer.data(), data, usable_bytes);
 
         spx_uint32_t in_len = static_cast<spx_uint32_t>(in_samples);
         spx_uint32_t out_len = static_cast<spx_uint32_t>(out_samples);
 
-        int err = speex_resampler_process_int(m_resampler, 0, in_buffer.data(), &in_len, out_buffer.data(), &out_len);
+        int err = speex_resampler_process_int(m_resampler, 0, m_resample_input_buffer.data(), &in_len,
+                                              out_buffer.data(), &out_len);
 
         if (err != RESAMPLER_ERR_SUCCESS) {
             switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Resampling failed with error code: %d\n", err);
@@ -606,35 +607,26 @@ class AudioStreamer {
                             continue;
                         }
 
-                        // The audio payload was already decoded: build a metadata-only payload
-                        // for events and logs (the README documents EVENT_PLAY as carrying the file path)
-                        bool notify_play = false;
-                        cJSON *play_root = cJSON_CreateObject();
-                        char *play_json = nullptr;
-                        if (play_root) {
-                            cJSON_AddStringToObject(play_root, "source", "serverContent");
-                            if (!m_disable_audiofiles) {
-                                std::string filePath = saveDebugAudioFile(rawAudio);
-                                if (!filePath.empty()) {
-                                    cJSON_AddStringToObject(play_root, "file", filePath.c_str());
-                                    notify_play = true;
+                        if (!m_disable_audiofiles) {
+                            const std::string file_path = saveDebugAudioFile(rawAudio);
+                            if (!file_path.empty()) {
+                                cJSON *play_root = cJSON_CreateObject();
+                                if (play_root) {
+                                    cJSON_AddStringToObject(play_root, "source", "serverContent");
+                                    cJSON_AddStringToObject(play_root, "file", file_path.c_str());
+                                    char *play_json = cJSON_PrintUnformatted(play_root);
+                                    if (play_json) {
+                                        m_notify(session, EVENT_PLAY, play_json);
+                                        free(play_json);
+                                    }
+                                    cJSON_Delete(play_root);
                                 }
                             }
-                            play_json = cJSON_PrintUnformatted(play_root);
-                        }
-                        if (play_json) {
-                            if (notify_play) {
-                                m_notify(session, EVENT_PLAY, play_json);
-                            }
-                            free(play_json);
-                        }
-                        if (play_root) {
-                            cJSON_Delete(play_root);
                         }
 
                         auto resampled = convertRawAudio(rawAudio);
                         if (!resampled.empty()) {
-                            push_audio_queue(resampled);
+                            push_audio_queue(std::move(resampled));
                             status = SWITCH_TRUE;
                         }
                     }
@@ -660,7 +652,7 @@ class AudioStreamer {
 
     // managing queue, check if empty before popping or peeking
 
-    void push_audio_queue(const std::vector<int16_t>& audio_data) {
+    void push_audio_queue(std::vector<int16_t>&& audio_data) {
         std::lock_guard<std::mutex> lock(m_audio_queue_mutex);
         const size_t total = audio_data.size();
         if (m_audio_queue_samples + total > max_playback_queue_samples()) {
@@ -674,7 +666,7 @@ class AudioStreamer {
             return;
         }
         if (total <= MAX_AUDIO_CHUNK_SAMPLES) {
-            m_audio_queue.push(audio_data);
+            m_audio_queue.push(std::move(audio_data));
         } else {
             size_t num_chunks = (total + MAX_AUDIO_CHUNK_SAMPLES - 1) / MAX_AUDIO_CHUNK_SAMPLES;
             switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG,
@@ -747,30 +739,10 @@ class AudioStreamer {
         if (base64Audio.empty())
             return false;
 
-        // Gemini Live API expects caller audio under realtimeInput.audio with a matching mimeType
-        const std::string mimeType = "audio/pcm;rate=" + std::to_string(m_send_sample_rate);
-
-        cJSON *root = cJSON_CreateObject();
-        cJSON *realtimeInput = cJSON_CreateObject();
-        cJSON *audio = cJSON_CreateObject();
-        if (root && realtimeInput && audio) {
-            cJSON_AddStringToObject(audio, "data", base64Audio.c_str());
-            cJSON_AddStringToObject(audio, "mimeType", mimeType.c_str());
-            cJSON_AddItemToObject(realtimeInput, "audio", audio);
-            cJSON_AddItemToObject(root, "realtimeInput", realtimeInput);
-        } else {
-            cJSON_Delete(root);
-            cJSON_Delete(realtimeInput);
-            cJSON_Delete(audio);
-            return false;
-        }
-
-        char *jsonStr = cJSON_PrintUnformatted(root);
-        const bool sent = jsonStr && webSocket.sendUtf8Text(ix::IXWebSocketSendData(jsonStr, strlen(jsonStr))).success;
-
-        cJSON_Delete(root);
-        switch_safe_free(jsonStr);
-        return sent;
+        // sendAudio() and flush_pending_audio() hold m_pending_audio_mutex,
+        // so the reusable message cannot be overwritten during WebSocket queuing.
+        const std::string& json = m_input_message.format(base64Audio);
+        return webSocket.sendUtf8Text(ix::IXWebSocketSendData(json.data(), json.size())).success;
     }
 
     bool writeBinary(const uint8_t *buffer, size_t len) {
@@ -937,6 +909,7 @@ class AudioStreamer {
     int in_sample_rate = 24000;  // playback sample rate (Gemini streams model audio at 24kHz)
     int out_sample_rate = 16000; // output default sample rate
     SpeexResamplerState *m_resampler = nullptr;
+    std::vector<int16_t> m_resample_input_buffer; // WebSocket receive thread only
     std::queue<std::vector<int16_t>> m_audio_queue;
     std::mutex m_audio_queue_mutex;
     size_t m_audio_queue_samples = 0;     // guarded by m_audio_queue_mutex
@@ -955,7 +928,7 @@ class AudioStreamer {
     std::mutex m_pending_audio_mutex;                              // guards m_pending_audio
     std::vector<uint8_t> m_pending_audio;                          // call audio held until setup completes
     std::atomic<bool> m_pending_overflow_logged{false};            // rate-limits the pending-buffer drop warning
-    uint32_t m_send_sample_rate = 16000;                           // Gemini expects PCM16 LINEAR audio
+    stream_protocol::RealtimeInputMessage m_input_message; // guarded by m_pending_audio_mutex
     private_t *m_context = nullptr;         // owner context; valid until the WebSocket thread has been joined
     uint8_t m_pending_raw_byte = 0;         // raw mode: trailing odd byte carried to the next binary frame
     bool m_has_pending_raw_byte = false;    // WebSocket thread only
