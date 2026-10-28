@@ -32,12 +32,14 @@ the OpenAI module and remains identical.
 Install FreeSWITCH development headers, OpenSSL, Zlib and SpeexDSP development packages, then:
 
 ```sh
-cmake -S . -B build -DENABLE_LOCAL=ON   # ENABLE_LOCAL points pkg-config at /usr/local/freeswitch
+cmake -S . -B build -DENABLE_LOCAL=ON -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 cmake --install build                    # installs mod_gemini_audio_stream.so into the FS modules dir
 ```
 
-The build consumes the `ixwebsocket` library that is vendored under `libs/`.
+Use `Release` to optimize both the module and the `ixwebsocket` library vendored under `libs/`.
+`ENABLE_LOCAL` only selects the local FreeSWITCH pkg-config directory; it does not enable
+compiler optimization. For profiling with symbols, use `RelWithDebInfo`.
 
 ## Quick start
 
