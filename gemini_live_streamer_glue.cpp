@@ -33,6 +33,7 @@
 #define MAX_JSON_DEPTH 128         /* guards the recursive cJSON parser against deeply nested peer JSON */
 #define MAX_STREAM_BUFFER_MS 1000  /* upper bound for the STREAM_BUFFER_SIZE capture aggregation window */
 #define MAX_HEARTBEAT_SECONDS 3600 /* upper bound for the STREAM_HEART_BEAT ping interval */
+#define MAX_TX_BACKLOG_BYTES (256 * 1024) /* terminate stalled streams instead of accumulating stale audio */
 #define MAX_SETUP_PENDING_BYTES 32000 /* hold at most ~1s of 16kHz mono PCM before the Gemini setup completes */
 
 // Persistent buffers for stream_frame to avoid per-frame heap allocations
@@ -107,6 +108,8 @@ size_t extract_server_content_audio(cJSON *json, std::vector<std::string>& audio
             continue;
         }
         audio_parts.emplace_back(data->valuestring);
+        // Keep the part metadata for the controller, but do not duplicate PCM in ESL events.
+        cJSON_DeleteItemFromObject(inline_data, "data");
         ++count;
     }
     return count;
@@ -631,6 +634,17 @@ class AudioStreamer {
                         }
                     }
                 }
+                if (part_count) {
+                    char *metadata = cJSON_PrintUnformatted(json);
+                    if (metadata) {
+                        m_notify(session, EVENT_JSON, metadata);
+                        free(metadata);
+                        status = SWITCH_TRUE;
+                    } else {
+                        // Fall back to forwarding the original message rather than losing control events.
+                        status = SWITCH_FALSE;
+                    }
+                }
                 break;
             }
 
@@ -742,13 +756,13 @@ class AudioStreamer {
         // sendAudio() and flush_pending_audio() hold m_pending_audio_mutex,
         // so the reusable message cannot be overwritten during WebSocket queuing.
         const std::string& json = m_input_message.format(base64Audio);
-        return webSocket.sendUtf8Text(ix::IXWebSocketSendData(json.data(), json.size())).success;
+        return sendBounded(json.data(), json.size(), false);
     }
 
     bool writeBinary(const uint8_t *buffer, size_t len) {
         if (!this->isConnected())
             return false;
-        return webSocket.sendBinary(ix::IXWebSocketSendData(reinterpret_cast<const char *>(buffer), len)).success;
+        return sendBounded(reinterpret_cast<const char *>(buffer), len, true);
     }
 
     // Caller audio must not reach Gemini before the setup handshake completes: the server
@@ -809,10 +823,30 @@ class AudioStreamer {
         m_pending_overflow_logged.store(false);
     }
 
+    bool sendBounded(const char *data, size_t size, bool binary) {
+        // Serialize all application writers so checking the backlog and adding a frame
+        // cannot race another audio or controller send. Reserve room for frame headers.
+        std::lock_guard<std::mutex> lock(m_send_mutex);
+        if (m_tx_overflow || !isConnected()) return false;
+        const size_t overhead = 1024;
+        const size_t pending = webSocket.bufferedAmount();
+        if (size > MAX_TX_BACKLOG_BYTES - overhead ||
+            pending > MAX_TX_BACKLOG_BYTES - overhead - size) {
+            m_tx_overflow = true;
+            switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
+                              "(%s) WebSocket transmit backlog exceeded %d bytes; closing stream\n",
+                              m_sessionId.c_str(), MAX_TX_BACKLOG_BYTES);
+            request_media_bug_close();
+            return false;
+        }
+        const ix::IXWebSocketSendData payload(data, size);
+        return (binary ? webSocket.sendBinary(payload) : webSocket.sendUtf8Text(payload)).success;
+    }
+
     bool writeText(const char *text) { // Gemini accepts JSON text frames; raw UTF-8 has no defined meaning
         if (!this->isConnected())
             return false;
-        return webSocket.sendUtf8Text(ix::IXWebSocketSendData(text, strlen(text))).success;
+        return sendBounded(text, strlen(text), false);
     }
 
     void deleteFiles() {
@@ -925,6 +959,8 @@ class AudioStreamer {
     std::atomic<bool> m_started{false};
     bool m_raw_audio_mode = false;
     std::atomic<bool> m_setup_complete{false};                     // Gemini setup acknowledged by the server
+    std::mutex m_send_mutex;
+    bool m_tx_overflow = false; // guarded by m_send_mutex
     std::mutex m_pending_audio_mutex;                              // guards m_pending_audio
     std::vector<uint8_t> m_pending_audio;                          // call audio held until setup completes
     std::atomic<bool> m_pending_overflow_logged{false};            // rate-limits the pending-buffer drop warning
